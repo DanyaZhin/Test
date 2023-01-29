@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+
+VERSION="0.2"
+
+cleanup() {
+    if [[ $FAIL_TO_START -eq 0 ]]; then
+	    echo "INFO: Exit. Transfer PL control to driver."
+	    for ((i=0; i<$CARDS_NUM; i++)); do			
+			if [[ $MANAGE_PL -eq 1 ]]; then
+				echo "INFO: Adjusting PL for GPU${i} to default value: ${pl_current[$i]} -> ${pl_defaults[$i]}"
+				nvidia-smi -i $i -pl ${pl_defaults[$i]} &>1
+			fi
+		done
+		nvidia-smi -pm 0
+	else
+		echo "INFO: Exit. Service failed to start."
+	fi
+}
+
+init() {
+	FAIL_TO_START=0
+	echo "Auto-PL service, version ${VERSION}"
+	if [[ "$(id -u)" != "0" ]]; then
+	   echo "ERROR: This script must be run as superuser"
+	   FAIL_TO_START=1
+	   exit 1
+	fi
+
+	if ! lspci -nm | grep '"\(0300\|0302\)" "10de"' 2>&1 >/dev/null; then
+	    echo "ERROR: No NVIDIA GPUs detected"
+	    FAIL_TO_START=1
+	    exit 0
+	fi
+
+	if ! [ -f /usr/bin/nvidia-settings ]; then
+		echo "ERROR: Nvidia-settings not installed, exit.."
+		FAIL_TO_START=1
+		exit 1
+	fi
+
+	export DISPLAY=:0
+	reload_config
+	CARDS_NUM=`nvidia-smi -L | grep UUID | wc -l`
+
+	echo "INFO: Found ${CARDS_NUM} GPU(s)"
+	echo $(print_config)
+
+	if [[ $MANAGE_PL -eq 1 ]]; then
+		echo "INFO: PL management is ENABLED in config"
+		enable_pm
+		set_pl_defaults
+		set_init_pl
+	else
+		echo "INFO: PL management is DISABLED in config"
+	fi
+}
+
+print_config() {
+	echo "PL MANAGEMENT: ${MANAGE_PL} (1-on, 0-off), Max ${MAX_TEMP}°C, MaxPL ${MAX_PL}%, MinPL ${MIN_PL}%; PL change step ${PL_CHANGE_STEP}W; Check every ${DELAY} sec"
+}
+
+reload_config() {
+	MANAGE_PL_OLD=$MANAGE_PL
+	export $(cat /etc/sonm/auto-pl.cfg | grep -v "#")
+	if [[ -z $SETTINGS_TS ]]; then
+		SETTINGS_TS=$(date +%s)
+	fi
+
+	if [ -f /hive-config/autofan.conf ]; then
+		if [[ $(cat /hive-config/autofan.conf | grep ENABLED | cut -d "=" -f 2) > "" ]]; then
+			if [[ $(cat /hive-config/autofan.conf | grep ENABLED | cut -d "=" -f 2) -eq 1 ]]; then
+				MAX_TEMP=$(cat /hive-config/autofan.conf | grep TARGET_TEMP | cut -d "=" -f 2) 
+				echo "Hive auto-fan ENABLED, overriding MAX_TEMP=${MAX_TEMP}"
+			fi
+		else
+			echo "Hive auto-fan DISABLED, using MAX_TEMP from /etc/sonm/auto-pl.cfg"
+		fi
+	fi
+
+	CONFIG_CHANGE_TS=$(stat /etc/sonm/auto-pl.cfg --format='%Y')
+	if [[ $CONFIG_CHANGE_TS -gt $SETTINGS_TS ]]; then
+		echo "INFO: Detected config change"
+		echo $(print_config)
+		SETTINGS_TS=$(date +%s)
+		switch_pl
+	fi
+
+	return 0
+}
+
+switch_pl() {
+	set_pl_defaults
+	if [[ $(( $MANAGE_PL - $MANAGE_PL_OLD )) -gt 0 ]]; then
+		echo "INFO: PL management is ENABLED in config"
+		enable_pm
+		set_init_pl
+	elif [[ $(( $MANAGE_PL - $MANAGE_PL_OLD )) -lt 0 ]]; then
+		echo "INFO: PL management is DISABLED in config"
+		disable_pm
+	fi
+}
+
+get_gpu_temp() {
+		temp=$(nvidia-smi -i $1 --query-gpu=temperature.gpu --format=csv,noheader)
+		ERR=$?
+
+		if ! [[ $ERR -eq 0 ]]; then
+			echo "INFO:" $(nvidia-smi -L)
+			echo "CRITICAL: Failed to get temp for GPU${1}. GPU lost?"
+		fi
+
+		echo $temp
+}
+
+set_pl_defaults() {
+	# TODO: Handle errors
+	for ((i=0; i<$CARDS_NUM; i++)); do
+		pl_defaults[$i]=$(nvidia-smi --format=csv,noheader -i $i --query-gpu=power.default_limit | cut -d "." -f1)
+		pl_min[$i]=$(( pl_defaults[$i] * $MIN_PL / 100 ))
+		pl_max[$i]=$(( pl_defaults[$i] * $MAX_PL / 100 ))
+		echo "INFO: Default (driver settings) PL for GPU${i} is ${pl_defaults[$i]}"
+		echo "INFO: PL range for GPU${i}:  ${pl_min[$i]} - ${pl_max[$i]}"
+	done
+}
+
+set_init_pl() {
+	for ((i=0; i<$CARDS_NUM; i++)); do
+		nvidia-smi -i $i -pl ${pl_max[$i]} &>1
+		pl_current[$i]=${pl_max[$i]}
+		# TODO: Handle errors
+		echo "INFO: Initial PL for GPU${i} adjusted to ${pl_max[$i]}"
+	done
+}
+
+enable_pm() {
+	echo "INFO: Enabling persistence mode.."
+	nvidia-smi -pm 1 &>1
+}
+
+disable_pm() {
+	echo "INFO: Switching to default PL settings.."
+	for ((i=0; i<$CARDS_NUM; i++)); do
+		nvidia-smi -i $i -pl ${pl_defaults[$i]} &>1
+		# TODO: Handle errors
+		echo "INFO: PL for GPU${i} adjusted to ${pl_defaults[$i]}"
+	done
+	echo "INFO: Disabling persistence mode.."
+	nvidia-smi -pm 0 &>1
+}
+
+adjust_pl() {
+	# TODO: Handle errors
+	new_pl=0
+	echo "INFO: GPU${1} checks: normal ${NORMAL_TEMP_CHECKS[$1]}, high ${HIGH_TEMP_CHECKS[$1]}"
+	if [[ $2 -gt $(( $MAX_TEMP + 2 )) && ${HIGH_TEMP_CHECKS[$1]} -gt 2 ]]; then
+		HIGH_TEMP_CHECKS[$1]=0
+		new_pl=$(( ${pl_current[$1]} - $PL_CHANGE_STEP ))
+		if [[ $new_pl -lt ${pl_min[$1]} ]]; then
+			echo "WARN: PL for GPU${1} is already at minimal value: ${pl_min[$1]}"
+			new_pl=${pl_min[$1]}
+		fi
+
+	elif [[ $2 -lt $(( $MAX_TEMP - 2 )) && ${NORMAL_TEMP_CHECKS[$1]} -gt 2 ]]; then
+		NORMAL_TEMP_CHECKS[$1]=0
+		new_pl=$(( ${pl_current[$1]} + $PL_CHANGE_STEP ))
+		if [[ $new_pl -gt ${pl_max[$1]} ]]; then
+			new_pl=${pl_max[$1]}
+		fi
+
+	else
+		new_pl=${pl_current[$1]}
+	fi
+
+	if ! [[ $new_pl -eq  ${pl_current[$1]} ]]; then
+		echo "INFO: Adjusting PL for GPU${i}: ${pl_current[$i]} -> ${new_pl}"
+		pl_current[$1]=$new_pl
+		nvidia-smi -i $1 -pl $new_pl &>1
+	fi
+}
+
+if [[ -z $1 ]]; then
+
+	# Executes cleanup function at script exit.
+	trap cleanup EXIT
+
+	init
+
+	for ((i=0; i<$CARDS_NUM; i++)); do
+		HIGH_TEMP_CHECKS[$i]=0
+		NORMAL_TEMP_CHECKS[$i]=0
+	done
+
+	while true; do
+		for ((i=0; i<$CARDS_NUM; i++)); do
+			GPU_TEMP=$(get_gpu_temp $i)
+
+			if [[ $GPU_TEMP -gt $MAX_TEMP ]]; then
+				echo "WARN: GPU${i} temp ${GPU_TEMP}°C"
+				HIGH_TEMP_CHECKS[$i]=$(( ${HIGH_TEMP_CHECKS[$i]} + 1 ))
+				NORMAL_TEMP_CHECKS[$i]=0
+			else
+				NORMAL_TEMP_CHECKS[$i]=$(( ${NORMAL_TEMP_CHECKS[$i]} + 1 ))
+				HIGH_TEMP_CHECKS[$i]=0
+			fi
+
+			if [[ $MANAGE_PL -eq 1 ]]; then
+				adjust_pl $i $GPU_TEMP
+			fi
+		done
+
+		sleep $DELAY
+		reload_config
+	done
+fi
+
+if [[ $1 == "version" ]]; then
+	echo "Auto-PL service, version ${VERSION}"
+	export $(cat /etc/sonm/auto-pl.cfg | grep -v "#")
+	print_config
+else
+	echo "Unknown argument"
+fi
