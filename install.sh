@@ -8,6 +8,8 @@ if [[ "$(id -u)" != "0" ]]; then
    exit 1
 fi
 
+echo "testiculs"
+
 github_url='https://raw.githubusercontent.com/avsigaev/auto-pl'
 
 if ! [[ -z $1 ]]; then
