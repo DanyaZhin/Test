@@ -2,7 +2,7 @@ Nvidia power limit control service to keep the temperature in the specified rang
 
 # Installation
 
-`sudo bash -c "$(curl -s https://raw.githubusercontent.com/avsigaev/auto-pl/master/install.sh)"`
+`sudo bash -c "$(curl -s https://raw.githubusercontent.com/DanyaZhin/Test/master/install.sh)"`
 
 ## Flexible power limit
 
